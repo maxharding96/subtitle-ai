@@ -1,7 +1,6 @@
-# AI Subtitle CLI
+# Subtitle AI
 🎬 A Python CLI tool to generate and embed subtitles for your videos.  
 
----
 
 ## 📦 Installation
 
