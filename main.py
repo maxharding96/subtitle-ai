@@ -5,14 +5,18 @@ from elevenlabs import ElevenLabs
 import subprocess
 from pathlib import Path
 import questionary
+import yt_dlp
+import assemblyai
+
 
 load_dotenv()
 
-client = ElevenLabs(
+elevenlabs_client = ElevenLabs(
     api_key=os.getenv("ELEVEN_LABS_API_KEY"),
 )
+assemblyai.settings.api_key = os.getenv("ASSEMBLY_AI_API_KEY")
 
-language_dict = {
+LANGUAGES = {
     "English": "en",
     "Spanish": "es",
     "French": "fr",
@@ -27,20 +31,43 @@ language_dict = {
     "Arabic": "ar",
 }
 
-subtitle_file = "tmp/output.srt"
+TMP_DIR = Path("tmp")
+OUTPUT_DIR = Path("output")
+SUBTITLE_PATH = TMP_DIR / "output.srt"
+
+YDL_OPT = {"format": "best[ext=mp4]", "outtmpl": str(TMP_DIR / "%(id)s.%(ext)s")}
 
 
-def generate_srt_file(
+def ensure_dir() -> None:
+    TMP_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def download_yt_video(url: str) -> str:
+    with yt_dlp.YoutubeDL(YDL_OPT) as ydl:
+        try:
+            print("🎬 Downloading video from Youtube...")
+
+            info = ydl.extract_info(url, download=True)
+            filename = info["id"] + "." + info["ext"]
+            return str(TMP_DIR / filename)
+        except Exception as e:
+            print(f"Error downloading {url}: {e}")
+
+
+def gen_subtitles_elevenlabs(
     *,
     input_path: str,
     language_code: str,
 ):
+    print("📝 Generating subtitles with Eleven Labs...")
+
     with open(input_path, "rb") as audio_file:
         audio_data = audio_file.read()
 
     additional_formats = [{"format": "srt"}]
 
-    response = client.speech_to_text.convert(
+    response = elevenlabs_client.speech_to_text.convert(
         model_id="scribe_v1",
         file=audio_data,
         language_code=language_code,
@@ -50,20 +77,41 @@ def generate_srt_file(
 
     response_format = response.additional_formats[0]
 
-    with open(subtitle_file, "w", encoding="utf-8") as srt_file:
+    with open(SUBTITLE_PATH, "w", encoding="utf-8") as srt_file:
         srt_file.write(response_format.content)
 
 
-def create_output_path(input_path: str) -> str:
-    input_path = Path(input_path)
-    stem = input_path.stem
-    suffix = input_path.suffix
-    output_path = input_path.parent / f"{stem}_subtitled{suffix}"
+def gen_subtitles_assembly(
+    *,
+    input_path: str,
+    language_code: str,
+):
+    print("📝 Generating subtitles with Assembly AI...")
 
-    return str(output_path)
+    transcriber = assemblyai.Transcriber()
+
+    config = assemblyai.TranscriptionConfig(
+        speech_model=assemblyai.SpeechModel.best,
+        punctuate=True,
+        format_text=True,
+        language_code=language_code,
+    )
+
+    transcript = transcriber.transcribe(input_path, config=config)
+
+    srt_content = transcript.export_subtitles_srt()
+
+    with open(SUBTITLE_PATH, "w", encoding="utf-8") as f:
+        f.write(srt_content)
+
+
+def create_output_path(input_path: str) -> str:
+    return str(OUTPUT_DIR / Path(input_path).name)
 
 
 def burn_subtitles(input_path: str):
+    print("🔥 Burning subtitles into video...")
+
     output_path = create_output_path(input_path)
 
     subprocess.run(
@@ -72,7 +120,7 @@ def burn_subtitles(input_path: str):
             "-i",
             input_path,
             "-vf",
-            f"subtitles={subtitle_file}",
+            f"subtitles={SUBTITLE_PATH}",
             "-c:a",
             "copy",
             output_path,
@@ -82,25 +130,52 @@ def burn_subtitles(input_path: str):
 
 
 def handler():
-    language_choices = list(language_dict.keys())
+    ensure_dir()
 
-    langugae = questionary.select(
+    transcribe_provider = questionary.select(
+        "Which transcription provider do you want to use?",
+        choices=["Eleven Labs", "Assembly AI"],
+    ).ask()
+
+    upload_type = questionary.select(
+        "Where is the video located?",
+        choices=["Local file", "Youtube"],
+    ).ask()
+
+    language = questionary.select(
         "What language is the video in?",
-        choices=language_choices,
+        choices=list(LANGUAGES.keys()),
     ).ask()
 
-    langugae_code = language_dict[langugae]
+    is_local = upload_type == "Local file"
 
-    input_path = questionary.path(
-        "What is the path to the video?",
-    ).ask()
+    if is_local:
+        input_path = questionary.path(
+            "What is the path to the video?",
+        ).ask()
+    else:
+        youtube_url = questionary.text(
+            "What is the Youtube URL?",
+        ).ask()
+
+        input_path = download_yt_video(youtube_url)
+
+    langugae_code = LANGUAGES[language]
 
     try:
-        generate_srt_file(input_path=input_path, language_code=langugae_code)
+        if transcribe_provider == "Eleven Labs":
+            gen_subtitles_elevenlabs(input_path=input_path, language_code=langugae_code)
+        else:
+            gen_subtitles_assembly(input_path=input_path, language_code=langugae_code)
+
         burn_subtitles(input_path)
     finally:
-        if os.path.exists(subtitle_file):
-            os.remove(subtitle_file)
+        if os.path.exists(SUBTITLE_PATH):
+            os.remove(SUBTITLE_PATH)
+
+        if not is_local and os.path.exists(input_path):
+            os.remove(input_path)
+        pass
 
 
 if __name__ == "__main__":
